@@ -59,9 +59,34 @@ strings:
    # entity-specific templates for importing files into the Unreal content browser
     # template logic is defined in Python, not settings:
     # tk-unreal/hooks/tk-multi-loader2/tk-unreal_actions.py
-    unreal_loader_asset_path: "/Game/Assets/{ue_sg_asset_type}/{ue_sg_asset_name}/"
-    unreal_loader_asset_name: "{ue_sg_asset_name}_{name}"
-    unreal_loader_shot_path: "/Game/Cinematics/Sequences/{ue_sg_sequence_name}/{ue_sg_shot_name}/"
-    unreal_loader_shot_name: "{ue_sg_shot_name}_{name}"
+    unreal_loader_asset_path: "/Game/Assets/AST/{ue_sg_asset_type}/{ue_sg_asset_name}/"
+    unreal_loader_asset_name: "ASSET_{ue_sg_asset_name}_{name}"
+    unreal_loader_shot_path: "/Game/Cinematics/Sequences/SEQ/{ue_sg_sequence_name}/{ue_sg_shot_name}/"
+    unreal_loader_shot_name: "SHOT_{ue_sg_shot_name}_{name}"
     unreal_loader_project_path: "/Game/Assets/"
-    unreal_loader_project_name: "{name}"
+    unreal_loader_project_name: "PROJECT_{name}"
+    
+    # Assets (mesh, material, texture)
+    unreal_loader_staticmesh_path: "/Game/Assets/SM/"
+    unreal_loader_staticmesh_name: "SM_{name}"
+    unreal_loader_skeletalmesh_path: "/Game/Assets/SK/"
+    unreal_loader_skeletalmesh_name: "SK_{name}"
+    unreal_loader_physicsasset_path: "/Game/Assets/PHYS/"
+    unreal_loader_physicsasset_name: "PHYS_{name}"
+    unreal_loader_material_path: "/Game/Assets/M/"
+    unreal_loader_material_name: "M_{name}" # M_ 또는 MI_
+    unreal_loader_texture_path: "/Game/Assets/T/"
+    unreal_loader_texture_name: "T_{name}"
+
+    # Assets (fur, fx)
+    unreal_loader_fx_path: "/Game/Assets/NS/"
+    unreal_loader_fx_name: "NS_{name}"
+    unreal_loader_groom_path: "/Game/Assets/GR/"
+    unreal_loader_groom_name: "GR_{name}" # 임의로 정함
+
+    # Shot (animation sequence, performance capture)
+    unreal_loader_animation_sq_path: "/Game/LevelSequence/{ue_sg_sequence_name}/{ue_sg_shot_name}/{ue_sg_shot_name}_char/AS"
+    unreal_loader_animation_sq_name: "AS_{ue_sg_shot_name}"
+    unreal_loader_performancecapture_path: "/Game/LevelSequence/{ue_sg_sequence_name}/{ue_sg_shot_name}/{ue_sg_shot_name}_char/PC"
+    unreal_loader_performancecapture_name: "PC_{ue_sg_shot_name}"
+    # 애니 데이터가 SQ에 들어가야 하는지 Asset에 들어가야 하는지 잘 모르겠음
