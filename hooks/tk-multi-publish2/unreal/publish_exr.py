@@ -800,21 +800,23 @@ class UnrealMoviePublishPlugin(HookBaseClass):
         :param str sequence_path: Content Browser path of sequence to render.
         :param presets: Optional :class:`unreal.MoviePipelineMasterConfig` instance to use for rendering.
         :param str shot_name: Optional shot name to render a single shot from this sequence.
-        :returns: True if EXR files were generated, False otherwise
-                string representing the path of the generated EXR directory
-        :raises ValueError: If a shot name is specified but can't be found in
-                            the sequence.
+        :returns: Tuple of (bool, str) where bool indicates if EXR files were generated,
+                and str is the output directory path
+        :raises ValueError: If a shot name is specified but can't be found in the sequence.
         """
         output_folder, output_file = os.path.split(output_path)
         movie_name = os.path.splitext(output_file)[0]
 
-        qsub = unreal.MoviePipelineQueueEngineSubsystem()
-        queue = qsub.get_queue()
+        # Initialize the Movie Pipeline Queue
+        queue_subsystem = unreal.MoviePipelineQueueSubsystem.get_movie_pipeline_queue_subsystem()
+        queue = queue_subsystem.get_queue()
         job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+        
+        # Set the sequence and map
         job.sequence = unreal.SoftObjectPath(sequence_path)
         job.map = unreal.SoftObjectPath(unreal_map_path)
         
-        # If a specific shot was given, disable all the others.
+        # Handle shot selection if specified
         if shot_name:
             shot_found = False
             for shot in job.shot_info:
@@ -823,73 +825,83 @@ class UnrealMoviePublishPlugin(HookBaseClass):
                     shot.enabled = False
                 else:
                     shot_found = True
+                    shot.enabled = True
             if not shot_found:
                 raise ValueError(
                     "Unable to find shot %s in sequence %s, aborting..." % (shot_name, sequence_path)
                 )
         
-        # Set settings from presets, if any
+        # Apply preset settings if provided
         if presets:
             job.set_preset_origin(presets)
         
-        # Ensure the settings we need are set.
+        # Get and configure the job configuration
         config = job.get_configuration()
         
         # Configure output settings
-        output_setting = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
+        output_setting = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineOutputSetting
+        )
         output_setting.output_directory = unreal.DirectoryPath(output_folder)
-        output_setting.output_resolution = unreal.IntPoint(1920, 1080)  # 높은 해상도로 변경
+        output_setting.output_resolution = unreal.IntPoint(1920, 1080)
         output_setting.file_name_format = movie_name
         output_setting.override_existing_output = True
+        output_setting.zero_pad_frame_numbers = 4  # Ensure consistent frame number padding
         
-        # Remove problematic settings
+        # Remove any problematic settings
         for setting, reason in self._check_render_settings(config):
             self.logger.warning("Disabling %s: %s." % (setting.get_name(), reason))
             config.remove_setting(setting)
 
-        # Default rendering with high quality settings
-        render_pass = config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
-        render_pass.disable_motion_blur = False
-        render_pass.disable_temporal_aa = False
-        render_pass.temporal_sample_count = 16
+        # Configure high quality rendering settings
+        deferred_pass = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineDeferredPassBase
+        )
+        deferred_pass.disable_motion_blur = False
+        deferred_pass.disable_temporal_aa = False
+        deferred_pass.temporal_sample_count = 16
+        
+        # Configure Anti-aliasing
+        aa_setting = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineAntiAliasingSetting
+        )
+        aa_setting.spatial_sample_count = 4
+        aa_setting.temporal_sample_count = 8
         
         # Configure EXR output
-        exr_output = config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput)
-        exr_output.output_format = unreal.EImageFormat.EXR
-        exr_output.file_name_format = "{sequence_name}_{frame_number}"
-        exr_output.handle_frame_count = 0
-        exr_output.output_frame_step = 1
+        exr_setting = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineImageSequenceOutput_EXR
+        )
+        exr_setting.output_format = "{sequence_name}_{camera_name}_{frame_number}"
+        exr_setting.handle_frame_count = 0
+        exr_setting.output_frame_step = 1
+        exr_setting.compression = unreal.EXRCompressionFormat.ZIP
+        exr_setting.include_render_passes = True  # Enable multi-layer EXR output
         
-        # The rest of the rendering process remains the same
+        # Save the queue configuration
         _, manifest_path = unreal.MoviePipelineEditorLibrary.save_queue_to_manifest_file(queue)
-
         manifest_path = os.path.abspath(manifest_path)
         manifest_dir, manifest_file = os.path.split(manifest_path)
+        
+        # Create temporary manifest file
         f, new_path = tempfile.mkstemp(
             suffix=os.path.splitext(manifest_file)[1],
             dir=manifest_dir
         )
         os.close(f)
         os.replace(manifest_path, new_path)
-
-        self.logger.debug("Queue manifest saved in %s" % new_path)
-        manifest_path = new_path.replace(
-            "%s%s" % (
-                os.path.abspath(
-                    os.path.join(unreal.SystemLibrary.get_project_directory(), "Saved")
-                ),
-                os.path.sep,
-            ),
-            "",
-        )
-        self.logger.debug("Manifest short path: %s" % manifest_path)
         
+        self.logger.debug("Queue manifest saved in %s" % new_path)
+        
+        # Convert manifest path to relative project path
+        project_dir = unreal.SystemLibrary.get_project_directory()
+        manifest_path = os.path.relpath(new_path, project_dir)
+        self.logger.debug("Manifest relative path: %s" % manifest_path)
+        
+        # Prepare command line arguments
         cmd_args = [
             sys.executable,
-            "%s" % os.path.join(
-                unreal.SystemLibrary.get_project_directory(),
-                "%s.uproject" % unreal.SystemLibrary.get_game_name(),
-            ),
+            os.path.join(project_dir, f"{unreal.SystemLibrary.get_game_name()}.uproject"),
             "MoviePipelineEntryMap?game=/Script/MovieRenderPipelineCore.MoviePipelineGameMode",
             "-game",
             "-Multiprocess",
@@ -898,32 +910,36 @@ class UnrealMoviePublishPlugin(HookBaseClass):
             "-log",
             "-Unattended",
             "-messaging",
-            "-SessionName=\"EXR Render\"",
+            "-SessionName=\"High Quality EXR Render\"",
             "-nohmd",
             "-windowed",
             "-ResX=1920",
             "-ResY=1080",
-            "-MoviePipelineConfig=\"%s\"" % manifest_path,
+            f"-MoviePipelineConfig=\"{manifest_path}\""
         ]
         
-        self.logger.info("Starting EXR render process...")
+        self.logger.info("Starting high quality EXR render process...")
         
+        # Prepare environment
         run_env = copy.copy(os.environ)
-        if "UE_SHOTGUN_BOOTSTRAP" in run_env:
-            del run_env["UE_SHOTGUN_BOOTSTRAP"]
-        if "UE_SHOTGRID_BOOTSTRAP" in run_env:
-            del run_env["UE_SHOTGRID_BOOTSTRAP"]
+        for bootstrap_var in ["UE_SHOTGUN_BOOTSTRAP", "UE_SHOTGRID_BOOTSTRAP"]:
+            run_env.pop(bootstrap_var, None)
         
-        subprocess.call(cmd_args, env=run_env)
-        
-        # Check for EXR files
-        import glob
-        output_pattern = os.path.join(output_folder, f"{movie_name}*.exr")
-        rendered_files = glob.glob(output_pattern)
-        
-        if not rendered_files:
-            self.logger.error(f"No EXR files found in {output_folder}")
+        # Execute render process
+        try:
+            subprocess.call(cmd_args, env=run_env)
+            
+            # Verify output files
+            output_pattern = os.path.join(output_folder, f"{movie_name}*.exr")
+            rendered_files = glob.glob(output_pattern)
+            
+            if not rendered_files:
+                self.logger.error(f"No EXR files found in {output_folder}")
+                return False, output_folder
+            
+            self.logger.info(f"Successfully rendered {len(rendered_files)} EXR files")
+            return True, output_folder
+            
+        except Exception as e:
+            self.logger.error(f"Error during rendering: {str(e)}")
             return False, output_folder
-        
-        self.logger.info(f"Successfully rendered {len(rendered_files)} EXR files")
-        return True, output_folder
