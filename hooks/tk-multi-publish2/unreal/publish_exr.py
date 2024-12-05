@@ -838,23 +838,27 @@ class UnrealMoviePublishPlugin(HookBaseClass):
         # Configure output settings
         output_setting = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
         output_setting.output_directory = unreal.DirectoryPath(output_folder)
-        output_setting.output_resolution = unreal.IntPoint(1280, 720)
+        output_setting.output_resolution = unreal.IntPoint(1920, 1080)  # 높은 해상도로 변경
         output_setting.file_name_format = movie_name
-        output_setting.override_existing_output = True  # Overwrite existing files
+        output_setting.override_existing_output = True
         
         # Remove problematic settings
         for setting, reason in self._check_render_settings(config):
             self.logger.warning("Disabling %s: %s." % (setting.get_name(), reason))
             config.remove_setting(setting)
 
-        # Default rendering
-        config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+        # Default rendering with high quality settings
+        render_pass = config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+        render_pass.disable_motion_blur = False
+        render_pass.disable_temporal_aa = False
+        render_pass.temporal_sample_count = 16
         
-        # Configure EXR output instead of ProRes
-        exr_output = config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
-        # Optional: Configure EXR specific settings
-        exr_output.compression = unreal.EXRCompressionFormat.ZIP  # or other compression options
-        exr_output.output_format = "{sequence_name}.{frame_number}.{extension}"  # Custom format for EXR sequence
+        # Configure EXR output
+        exr_output = config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput)
+        exr_output.output_format = unreal.EImageFormat.EXR
+        exr_output.file_name_format = "{sequence_name}_{frame_number}"
+        exr_output.handle_frame_count = 0
+        exr_output.output_frame_step = 1
         
         # The rest of the rendering process remains the same
         _, manifest_path = unreal.MoviePipelineEditorLibrary.save_queue_to_manifest_file(queue)
@@ -894,42 +898,15 @@ class UnrealMoviePublishPlugin(HookBaseClass):
             "-log",
             "-Unattended",
             "-messaging",
-            "-SessionName=\"Publish2 Movie Render\"",
+            "-SessionName=\"EXR Render\"",
             "-nohmd",
             "-windowed",
-            "-ResX=1280",
-            "-ResY=720",
-            "-dpcvars=%s" % ",".join([
-                "sg.ViewDistanceQuality=4",
-                "sg.AntiAliasingQuality=4",
-                "sg.ShadowQuality=4",
-                "sg.PostProcessQuality=4",
-                "sg.TextureQuality=4",
-                "sg.EffectsQuality=4",
-                "sg.FoliageQuality=4",
-                "sg.ShadingQuality=4",
-                "r.TextureStreaming=0",
-                "r.ForceLOD=0",
-                "r.SkeletalMeshLODBias=-10",
-                "r.ParticleLODBias=-10",
-                "foliage.DitheredLOD=0",
-                "foliage.ForceLOD=0",
-                "r.Shadow.DistanceScale=10",
-                "r.ShadowQuality=5",
-                "r.Shadow.RadiusThreshold=0.001000",
-                "r.ViewDistanceScale=50",
-                "r.D3D12.GPUTimeout=0",
-                "a.URO.Enable=0",
-            ]),
-            "-execcmds=r.HLOD 0",
+            "-ResX=1920",
+            "-ResY=1080",
             "-MoviePipelineConfig=\"%s\"" % manifest_path,
         ]
         
-        unreal.log(
-            "Movie Queue command-line arguments: {}".format(
-                " ".join(cmd_args)
-            )
-        )
+        self.logger.info("Starting EXR render process...")
         
         run_env = copy.copy(os.environ)
         if "UE_SHOTGUN_BOOTSTRAP" in run_env:
@@ -937,9 +914,16 @@ class UnrealMoviePublishPlugin(HookBaseClass):
         if "UE_SHOTGRID_BOOTSTRAP" in run_env:
             del run_env["UE_SHOTGRID_BOOTSTRAP"]
         
-        self.logger.info("Running %s" % cmd_args)
         subprocess.call(cmd_args, env=run_env)
         
-        # Check for EXR files instead of a single movie file
-        output_dir = os.path.join(output_folder, movie_name)
-        return os.path.isdir(output_dir) and any(f.endswith('.exr') for f in os.listdir(output_dir)), output_dir
+        # Check for EXR files
+        import glob
+        output_pattern = os.path.join(output_folder, f"{movie_name}*.exr")
+        rendered_files = glob.glob(output_pattern)
+        
+        if not rendered_files:
+            self.logger.error(f"No EXR files found in {output_folder}")
+            return False, output_folder
+        
+        self.logger.info(f"Successfully rendered {len(rendered_files)} EXR files")
+        return True, output_folder
