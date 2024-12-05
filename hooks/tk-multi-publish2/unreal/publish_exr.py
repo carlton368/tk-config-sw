@@ -793,153 +793,175 @@ class UnrealMoviePublishPlugin(HookBaseClass):
 
     def _unreal_render_sequence_with_movie_queue(self, output_path, unreal_map_path, sequence_path, presets=None, shot_name=None):
         """
-        Renders a given sequence in a given level with the Movie Render queue to EXR format.
+        언리얼 엔진의 Movie Render Queue를 사용하여 EXR 포맷으로 시퀀스를 렌더링합니다.
 
-        :param str output_path: Full path to the EXR sequence to render.
-        :param str unreal_map_path: Path of the Unreal map in which to run the sequence.
-        :param str sequence_path: Content Browser path of sequence to render.
-        :param presets: Optional :class:`unreal.MoviePipelineMasterConfig` instance to use for rendering.
-        :param str shot_name: Optional shot name to render a single shot from this sequence.
-        :returns: Tuple of (bool, str) where bool indicates if EXR files were generated,
-                and str is the output directory path
-        :raises ValueError: If a shot name is specified but can't be found in the sequence.
+        :param str output_path: 렌더링될 EXR 시퀀스의 전체 경로
+        :param str unreal_map_path: 시퀀스를 실행할 언리얼 맵의 경로
+        :param str sequence_path: 렌더링할 시퀀스의 콘텐츠 브라우저 경로
+        :param presets: 선택적 렌더링 프리셋 설정 (기본값: None)
+        :param str shot_name: 특정 샷만 렌더링할 경우의 샷 이름 (기본값: None)
+        :returns: (성공 여부, 출력 디렉토리 경로)를 포함하는 튜플
         """
         output_folder, output_file = os.path.split(output_path)
         movie_name = os.path.splitext(output_file)[0]
-
-        # Initialize the Movie Pipeline Queue
+        
+        # 출력 디렉토리 생성
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Movie Pipeline Queue 초기화
         queue_subsystem = unreal.MoviePipelineQueueSubsystem.get_movie_pipeline_queue_subsystem()
+        if not queue_subsystem:
+            self.logger.error("Movie Pipeline Queue Subsystem을 초기화할 수 없습니다.")
+            return False, output_folder
+            
         queue = queue_subsystem.get_queue()
         job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
         
-        # Set the sequence and map
+        # 시퀀스와 맵 설정
         job.sequence = unreal.SoftObjectPath(sequence_path)
         job.map = unreal.SoftObjectPath(unreal_map_path)
         
-        # Handle shot selection if specified
+        # 특정 샷이 지정된 경우 해당 샷만 활성화
         if shot_name:
             shot_found = False
             for shot in job.shot_info:
                 if shot.outer_name != shot_name:
-                    self.logger.info("Disabling shot %s" % shot.outer_name)
+                    self.logger.info("샷 비활성화: %s" % shot.outer_name)
                     shot.enabled = False
                 else:
                     shot_found = True
                     shot.enabled = True
             if not shot_found:
-                raise ValueError(
-                    "Unable to find shot %s in sequence %s, aborting..." % (shot_name, sequence_path)
-                )
+                self.logger.error("시퀀스 %s에서 샷 %s를 찾을 수 없습니다." % (sequence_path, shot_name))
+                return False, output_folder
         
-        # Apply preset settings if provided
-        if presets:
-            job.set_preset_origin(presets)
-        
-        # Get and configure the job configuration
+        # 작업 설정 구성
         config = job.get_configuration()
+        if not config:
+            self.logger.error("작업 설정을 가져올 수 없습니다.")
+            return False, output_folder
         
-        # Configure output settings
+        # 프리셋이 있는 경우 적용, 없는 경우 기본 설정 사용
+        if presets:
+            self.logger.info("프리셋 설정 적용 중...")
+            job.set_preset_origin(presets)
+        else:
+            self.logger.info("기본 설정 사용...")
+        
+        # 출력 설정 구성
         output_setting = config.find_or_add_setting_by_class(
             unreal.MoviePipelineOutputSetting
         )
+        if not output_setting:
+            self.logger.error("출력 설정을 구성할 수 없습니다.")
+            return False, output_folder
+            
         output_setting.output_directory = unreal.DirectoryPath(output_folder)
         output_setting.output_resolution = unreal.IntPoint(1920, 1080)
         output_setting.file_name_format = movie_name
         output_setting.override_existing_output = True
-        output_setting.zero_pad_frame_numbers = 4  # Ensure consistent frame number padding
+        output_setting.zero_pad_frame_numbers = 4
+        output_setting.use_custom_frames = False
         
-        # Remove any problematic settings
+        # 문제가 있는 설정 제거
         for setting, reason in self._check_render_settings(config):
-            self.logger.warning("Disabling %s: %s." % (setting.get_name(), reason))
+            self.logger.warning("설정 비활성화: %s: %s" % (setting.get_name(), reason))
             config.remove_setting(setting)
 
-        # Configure high quality rendering settings
+        # 렌더링 품질 설정 (프리셋이 없는 경우의 기본값)
         deferred_pass = config.find_or_add_setting_by_class(
             unreal.MoviePipelineDeferredPassBase
         )
+        if not deferred_pass:
+            self.logger.error("렌더링 품질 설정을 구성할 수 없습니다.")
+            return False, output_folder
+            
         deferred_pass.disable_motion_blur = False
         deferred_pass.disable_temporal_aa = False
         deferred_pass.temporal_sample_count = 16
         
-        # Configure Anti-aliasing
+        # 안티앨리어싱 설정
         aa_setting = config.find_or_add_setting_by_class(
             unreal.MoviePipelineAntiAliasingSetting
         )
+        if not aa_setting:
+            self.logger.error("안티앨리어싱 설정을 구성할 수 없습니다.")
+            return False, output_folder
+            
         aa_setting.spatial_sample_count = 4
         aa_setting.temporal_sample_count = 8
         
-        # Configure EXR output
+        # EXR 출력 설정
         exr_setting = config.find_or_add_setting_by_class(
             unreal.MoviePipelineImageSequenceOutput_EXR
         )
-        exr_setting.output_format = "{sequence_name}_{camera_name}_{frame_number}"
+        if not exr_setting:
+            self.logger.error("EXR 출력 설정을 구성할 수 없습니다.")
+            return False, output_folder
+            
+        exr_setting.output_format = "{sequence_name}_{frame_number}"
         exr_setting.handle_frame_count = 0
         exr_setting.output_frame_step = 1
         exr_setting.compression = unreal.EXRCompressionFormat.ZIP
-        exr_setting.include_render_passes = True  # Enable multi-layer EXR output
+        exr_setting.include_render_passes = True
         
-        # Save the queue configuration
+        # 큐 설정 저장
         _, manifest_path = unreal.MoviePipelineEditorLibrary.save_queue_to_manifest_file(queue)
+        if not manifest_path:
+            self.logger.error("큐 설정을 저장할 수 없습니다.")
+            return False, output_folder
+            
         manifest_path = os.path.abspath(manifest_path)
-        manifest_dir, manifest_file = os.path.split(manifest_path)
         
-        # Create temporary manifest file
-        f, new_path = tempfile.mkstemp(
-            suffix=os.path.splitext(manifest_file)[1],
-            dir=manifest_dir
-        )
-        os.close(f)
-        os.replace(manifest_path, new_path)
-        
-        self.logger.debug("Queue manifest saved in %s" % new_path)
-        
-        # Convert manifest path to relative project path
+        # 프로젝트 디렉토리 경로 가져오기
         project_dir = unreal.SystemLibrary.get_project_directory()
-        manifest_path = os.path.relpath(new_path, project_dir)
-        self.logger.debug("Manifest relative path: %s" % manifest_path)
+        manifest_rel_path = os.path.relpath(manifest_path, project_dir)
         
-        # Prepare command line arguments
+        # 커맨드라인 인자 준비
         cmd_args = [
             sys.executable,
             os.path.join(project_dir, f"{unreal.SystemLibrary.get_game_name()}.uproject"),
-            "MoviePipelineEntryMap?game=/Script/MovieRenderPipelineCore.MoviePipelineGameMode",
             "-game",
-            "-Multiprocess",
-            "-NoLoadingScreen",
-            "-FixedSeed",
+            "-NoSplash",
             "-log",
-            "-Unattended",
-            "-messaging",
-            "-SessionName=\"High Quality EXR Render\"",
-            "-nohmd",
-            "-windowed",
+            "-RenderOffscreen",
+            "-NoTextureStreaming",
+            f"-MoviePipelineConfig=\"{manifest_rel_path}\"",
             "-ResX=1920",
-            "-ResY=1080",
-            f"-MoviePipelineConfig=\"{manifest_path}\""
+            "-ResY=1080"
         ]
         
-        self.logger.info("Starting high quality EXR render process...")
+        self.logger.info("고품질 EXR 렌더링 시작...")
         
-        # Prepare environment
+        # 환경 변수 설정
         run_env = copy.copy(os.environ)
         for bootstrap_var in ["UE_SHOTGUN_BOOTSTRAP", "UE_SHOTGRID_BOOTSTRAP"]:
-            run_env.pop(bootstrap_var, None)
+            if bootstrap_var in run_env:
+                del run_env[bootstrap_var]
         
-        # Execute render process
-        try:
-            subprocess.call(cmd_args, env=run_env)
-            
-            # Verify output files
-            output_pattern = os.path.join(output_folder, f"{movie_name}*.exr")
-            rendered_files = glob.glob(output_pattern)
-            
-            if not rendered_files:
-                self.logger.error(f"No EXR files found in {output_folder}")
-                return False, output_folder
-            
-            self.logger.info(f"Successfully rendered {len(rendered_files)} EXR files")
-            return True, output_folder
-            
-        except Exception as e:
-            self.logger.error(f"Error during rendering: {str(e)}")
+        # 렌더링 프로세스 실행
+        process = subprocess.Popen(
+            cmd_args,
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        # 프로세스 완료 대기 (1시간 타임아웃)
+        stdout, stderr = process.communicate(timeout=3600)
+        
+        if process.returncode != 0:
+            self.logger.error(f"렌더링 실패: {stderr}")
             return False, output_folder
+        
+        # 출력 파일 확인
+        output_pattern = os.path.join(output_folder, f"{movie_name}*.exr")
+        rendered_files = glob.glob(output_pattern)
+        
+        if not rendered_files:
+            self.logger.error(f"EXR 파일을 찾을 수 없음: {output_folder}")
+            return False, output_folder
+        
+        self.logger.info(f"렌더링 완료: {len(rendered_files)}개의 EXR 파일")
+        return True, output_folder
