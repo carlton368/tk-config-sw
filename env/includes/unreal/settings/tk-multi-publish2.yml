@@ -29,6 +29,10 @@ settings.tk-multi-publish2.unreal.project:
     hook: "{self}/publish_file.py:{config}/tk-multi-publish2/unreal/publish_movie.py"
     settings:
         Publish Template: unreal.movie_publish
+  - name: Render EXR and Publish to ShotGrid
+    hook: "{self}/publish_file.py:{config}/tk-multi-publish2/unreal/publish_exr.py"
+    settings:
+        Publish Template: unreal.exr_publish
   help_url: *help_url
   location: "@apps.tk-multi-publish2.location"
 
