@@ -797,112 +797,380 @@ class UnrealMoviePublishPlugin(HookBaseClass):
 
     def _unreal_render_sequence_with_movie_queue(self, output_path, unreal_map_path, sequence_path, presets=None, shot_name=None):
         """
-        Renders a given sequence in a given level with the Movie Render Queue to EXR format.
-        Uses minimal settings to ensure stability.
+        Renders a given sequence in a given level with the Movie Render queue using EXR output.
         """
         output_folder, output_file = os.path.split(output_path)
         sequence_name = os.path.splitext(output_file)[0]
 
-        # Setup basic queue and job
         qsub = unreal.MoviePipelineQueueEngineSubsystem()
         queue = qsub.get_queue()
         job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+        
+        # Load sequence asset to get frame range
+        sequence = unreal.EditorAssetLibrary.load_asset(sequence_path)
+        if not sequence:
+            raise RuntimeError(f"Failed to load sequence: {sequence_path}")
+
+        # Get sequence frame range
+        fps = sequence.get_display_rate()
+        start_frame = sequence.get_playback_start()
+        end_frame = sequence.get_playback_end()
+        
+        # Convert frame times to frame numbers
+        start_frame_number = int(start_frame.frame_number)
+        end_frame_number = int(end_frame.frame_number)
+
+        # Configure job
         job.sequence = unreal.SoftObjectPath(sequence_path)
         job.map = unreal.SoftObjectPath(unreal_map_path)
-        
-        # Handle specific shot if provided
-        if shot_name:
-            shot_found = False
-            for shot in job.shot_info:
-                if shot.outer_name != shot_name:
-                    self.logger.info("Disabling shot %s" % shot.outer_name)
-                    shot.enabled = False
-                else:
-                    shot_found = True
-            if not shot_found:
-                raise ValueError("Unable to find shot %s in sequence %s" % (shot_name, sequence_path))
 
-        # Set settings from presets if provided
-        if presets:
-            job.set_preset_origin(presets)
-        
-        # Configure render settings
+        # Configure the output settings
         config = job.get_configuration()
-        
-        # Basic output settings
         output_setting = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
         output_setting.output_directory = unreal.DirectoryPath(output_folder)
-        output_setting.output_resolution = unreal.IntPoint(1280, 720)
+        output_setting.output_resolution = unreal.IntPoint(1920, 1080)
         output_setting.file_name_format = sequence_name
         output_setting.override_existing_output = True
         
-        # Remove any existing output settings to avoid conflicts
-        config.remove_setting_by_class(unreal.MoviePipelineAppleProResOutput)
-        
-        # Add EXR output setting
-        config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutputEXR)
-        
-        # Add basic deferred pass for rendering
-        config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
-
-        # Save queue configuration
-        _, manifest_path = unreal.MoviePipelineEditorLibrary.save_queue_to_manifest_file(queue)
-        manifest_path = os.path.abspath(manifest_path)
-        manifest_dir, manifest_file = os.path.split(manifest_path)
-        
-        f, new_path = tempfile.mkstemp(
-            suffix=os.path.splitext(manifest_file)[1],
-            dir=manifest_dir
-        )
-        os.close(f)
-        os.replace(manifest_path, new_path)
-
-        # Get relative path for manifest
-        manifest_path = new_path.replace(
-            "%s%s" % (
-                os.path.abspath(
-                    os.path.join(unreal.SystemLibrary.get_project_directory(), "Saved")
-                ),
-                os.path.sep,
-            ),
-            "",
-        )
-
-        # Basic command line arguments
-        cmd_args = [
-            sys.executable,
-            "%s" % os.path.join(
-                unreal.SystemLibrary.get_project_directory(),
-                "%s.uproject" % unreal.SystemLibrary.get_game_name(),
-            ),
-            "MoviePipelineEntryMap?game=/Script/MovieRenderPipelineCore.MoviePipelineGameMode",
-            "-game",
-            "-Multiprocess",
-            "-NoLoadingScreen",
-            "-FixedSeed",
-            "-log",
-            "-Unattended",
-            "-messaging",
-            "-SessionName=\"EXR Sequence Render\"",
-            "-nohmd",
-            "-windowed",
-            "-ResX=1280",
-            "-ResY=720",
-            # Basic quality settings
-            "-dpcvars=sg.ViewDistanceQuality=4,sg.AntiAliasingQuality=4",
-            "-MoviePipelineConfig=\"%s\"" % manifest_path,
-        ]
-
-        # Execute render
-        run_env = copy.copy(os.environ)
-        if "UE_SHOTGUN_BOOTSTRAP" in run_env:
-            del run_env["UE_SHOTGUN_BOOTSTRAP"]
-        if "UE_SHOTGRID_BOOTSTRAP" in run_env:
-            del run_env["UE_SHOTGRID_BOOTSTRAP"]
+        # Set frame range
+        frame_setting = config.find_or_add_setting_by_class(unreal.MoviePipelineFrameSetting)
+        if frame_setting:
+            self.logger.info(f"Setting frame range: {start_frame_number} to {end_frame_number}")
+            frame_setting.start_frame = start_frame_number
+            frame_setting.end_frame = end_frame_number
+            frame_setting.custom_start_frame = start_frame  # Original frame time
+            frame_setting.custom_end_frame = end_frame      # Original frame time
+            frame_setting.use_custom_start_frame = True
+            frame_setting.use_custom_end_frame = True
             
-        self.logger.info("Starting EXR sequence render...")
-        subprocess.call(cmd_args, env=run_env)
+        # Configure EXR output
+        exr_output = config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_EXR)
+        exr_output.output_file_name_format = "{sequence_name}.{frame_number:04d}"
+        exr_output.compression = unreal.EXRCompressionFormat.ZIP
+        
+        # Add render pass
+        config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
+        
+        # Execute render using PIE
+        executor = unreal.MoviePipelinePIEExecutor()
+        qsub.render_queue_with_executor_instance(executor)
 
-        # Check for output directory
-        output_dir = os.path.join(output_folder, sequence_name)
-        return os.path.isdir(output_dir), output_dir
+        # Check if files were generated
+        expected_frames = end_frame_number - start_frame_number + 1
+        output_files = [f for f in os.listdir(output_folder) if f.endswith('.exr')]
+        
+        # Verify frame range
+        rendered_frames = len(output_files)
+        if rendered_frames != expected_frames:
+            self.logger.warning(
+                f"Expected {expected_frames} frames but got {rendered_frames} frames"
+            )
+            return False, None
+            
+        return True, output_folder
+class UnrealEXRPublishPlugin(HookBaseClass):
+    """
+    Plugin for publishing an Unreal sequence as EXR image sequences.
+
+    This hook relies on functionality found in the base file publisher hook in
+    the publish2 app and should inherit from it in the configuration. The hook
+    setting for this plugin should look something like this::
+
+        hook: "{self}/publish_file.py:{engine}/tk-multi-publish2/basic/publish_session.py"
+    """
+    def __init__(self, *args, **kwargs):
+        super(UnrealEXRPublishPlugin, self).__init__(*args, **kwargs)
+        print("PUBLISH_EXR INIT")
+
+    @property
+    def description(self):
+        """
+        Verbose, multi-line description of what the plugin does. This can
+        contain simple html for formatting.
+        """
+
+        return """
+        Publishes the sequence as an EXR image sequence to ShotGrid. A <b>Publish</b> 
+        entry will be created in ShotGrid which will include a reference to the image
+        sequence path on disk. A <b>Version</b> entry will also be created in ShotGrid 
+        with the first frame being uploaded for review purposes.
+        <br><br>
+        EXR sequences will be rendered using the Movie Render Queue with high-quality
+        settings and multi-channel support for maximum flexibility in compositing.
+        """
+
+    @property
+    def settings(self):
+        """
+        Dictionary defining the settings that this plugin expects to receive
+        through the settings parameter in the accept, validate, publish and
+        finalize methods.
+        """
+        # inherit the settings from the base publish plugin
+        base_settings = super(UnrealEXRPublishPlugin, self).settings or {}
+
+        # Settings specific to this plugin
+        exr_publish_settings = {
+            "Publish Template": {
+                "type": "template",
+                "default": None,
+                "description": "Template path for published EXR sequences. Should"
+                             "correspond to a template defined in templates.yml.",
+            },
+            "Render Preset": {
+                "type": "string",
+                "default": None,
+                "description": "Optional path to Movie Pipeline render preset"
+            },
+            "Frame Rate": {
+                "type": "int",
+                "default": 24,
+                "description": "Frame rate for the rendered sequence"
+            },
+            "Resolution": {
+                "type": "dict",
+                "default": {"width": 1920, "height": 1080},
+                "description": "Resolution for the rendered sequence"
+            }
+        }
+
+        base_settings.update(exr_publish_settings)
+        return base_settings
+
+    @property
+    def item_filters(self):
+        """
+        List of item types that this plugin is interested in.
+        """
+        return ["unreal.asset.LevelSequence"]
+
+    def accept(self, settings, item):
+        """
+        Method called by the publisher to determine if an item is of any
+        interest to this plugin. Only items matching the filters defined via the
+        item_filters property will be presented to this method.
+        """
+        accepted = True
+
+        publisher = self.parent
+        template_name = settings["Publish Template"].value
+        if template_name:
+            publish_template = publisher.get_template_by_name(template_name)
+            self.logger.debug("Checking template: %s" % publish_template)
+            if not publish_template:
+                self.logger.debug(
+                    "A publish template could not be determined for the "
+                    "item. Not accepting the item."
+                )
+                accepted = False
+        else:
+            self.logger.debug("No template provided. Not accepting the item.")
+            accepted = False
+
+        if not hasattr(unreal, "MoviePipelineQueueEngineSubsystem"):
+            self.logger.warning(
+                "Movie Render Queue is required for EXR sequence rendering. "
+                "Please ensure you are using Unreal Engine 4.26 or later."
+            )
+            accepted = False
+
+        # We've validated the publish template. Add it to the item properties
+        if accepted:
+            item.properties["publish_template"] = publish_template
+
+        return {
+            "accepted": accepted,
+            "checked": True
+        }
+
+    def validate(self, settings, item):
+        """
+        Validates the given item to check that it is ok to publish.
+        """
+        asset_path = item.properties.get("asset_path")
+        asset_name = item.properties.get("asset_name")
+        if not asset_path or not asset_name:
+            self.logger.debug("Sequence path or name not configured.")
+            return False
+
+        # Get the path in a normalized state
+        path = sgtk.util.ShotgunPath.normalize(item.properties["path"])
+        
+        # Check that the parent folder exists
+        folder = os.path.dirname(path)
+        if not os.path.exists(folder):
+            try:
+                os.makedirs(folder)
+            except OSError as e:
+                self.logger.error(
+                    "Failed to create parent folder for EXR sequence: %s" % str(e)
+                )
+                return False
+
+        return True
+
+    def publish(self, settings, item):
+        """
+        Executes the publish logic for the given item and settings.
+        """
+        publisher = self.parent
+        
+        # Get the path in a normalized state
+        path = sgtk.util.ShotgunPath.normalize(item.properties["path"])
+        
+        # Ensure the parent folder exists
+        folder = os.path.dirname(path)
+        publisher.ensure_folder_exists(folder)
+
+        # Configure and execute the EXR render
+        try:
+            self._render_exr_sequence(path, settings, item)
+        except Exception as e:
+            self.logger.error("Failed to render EXR sequence: %s" % str(e))
+            raise
+
+        # Let the base class register the publish
+        super(UnrealEXRPublishPlugin, self).publish(settings, item)
+
+        # Create a Version entry linked with the publish
+        self._create_version(settings, item)
+
+    def _render_exr_sequence(self, output_path, settings, item):
+        """
+        Renders the sequence to EXR using Movie Render Queue.
+        """
+        # Configure Movie Pipeline for EXR output
+        qsub = unreal.MoviePipelineQueueEngineSubsystem()
+        queue = qsub.get_queue()
+        job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+        
+        # Set sequence and map
+        job.sequence = unreal.SoftObjectPath(item.properties["asset_path"])
+        job.map = unreal.SoftObjectPath(item.properties["unreal_map_path"])
+
+        # Configure the job settings
+        config = job.get_configuration()
+        
+        # Set up EXR output settings
+        output_setting = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineImageSequenceOutput_EXR
+        )
+        output_setting.output_directory = unreal.DirectoryPath(os.path.dirname(output_path))
+        output_setting.file_name_format = os.path.splitext(os.path.basename(output_path))[0]
+        
+        # Configure resolution
+        resolution = settings["Resolution"].value
+        output_setting.output_resolution = unreal.IntPoint(
+            resolution["width"],
+            resolution["height"]
+        )
+
+        # Set frame rate
+        output_setting.output_frame_rate = unreal.FrameRate(settings["Frame Rate"].value)
+        output_setting.use_custom_frame_rate = True
+        
+        # Configure EXR-specific settings
+        output_setting.compression = unreal.EXRCompressionFormat.ZIP
+        output_setting.bit_depth = unreal.EXRBitDepth.BIT_DEPTH_32
+        
+        # Add render passes for various AOVs
+        render_pass = config.find_or_add_setting_by_class(
+            unreal.MoviePipelineDeferredPassBase
+        )
+        render_pass.output_data = {
+            "Beauty": True,
+            "DiffuseColor": True,
+            "Normals": True,
+            "WorldPosition": True,
+            "AmbientOcclusion": True
+        }
+
+        # Execute the render
+        manifest_path = self._execute_render_queue(queue)
+        
+        # Wait for completion and verify output
+        if not os.path.exists(output_path):
+            raise RuntimeError("Failed to generate EXR sequence at: %s" % output_path)
+
+    def _execute_render_queue(self, queue):
+        """
+        Executes the render queue and returns the manifest path.
+        """
+        _, manifest_path = unreal.MoviePipelineEditorLibrary.save_queue_to_manifest_file(queue)
+        
+        # Execute the queue in a separate process
+        cmdline_args = [
+            sys.executable,
+            "-ExecutePipeline",
+            "-RenderOffscreen",
+            manifest_path
+        ]
+        
+        # Run the render process
+        subprocess.call(cmdline_args)
+        
+        return manifest_path
+
+    def _create_version(self, settings, item):
+        """
+        Creates a Version entry in ShotGrid.
+        """
+        publisher = self.parent
+        
+        # Get the path in a normalized state
+        path = sgtk.util.ShotgunPath.normalize(item.properties["path"])
+        
+        # Get the publish data
+        publish_data = item.properties.get("sg_publish_data")
+        
+        # Create the version
+        version_data = {
+            "project": item.context.project,
+            "code": item.name,
+            "description": item.description,
+            "entity": self._get_version_entity(item),
+            "sg_path_to_frames": path,
+            "sg_status_list": "rev",
+            "sg_task": item.context.task
+        }
+        
+        if publish_data:
+            version_data["published_files"] = [publish_data]
+        
+        version = publisher.shotgun.create("Version", version_data)
+        
+        # Upload the first frame for review
+        first_frame = self._get_first_frame(path)
+        if first_frame:
+            publisher.shotgun.upload(
+                "Version",
+                version["id"],
+                first_frame,
+                "sg_uploaded_movie"
+            )
+        
+        return version
+
+    def _get_first_frame(self, path):
+        """
+        Returns the path to the first frame in the sequence.
+        """
+        import glob
+        
+        seq_pattern = "%s.*" % os.path.splitext(path)[0]
+        frames = sorted(glob.glob(seq_pattern))
+        
+        if frames:
+            return frames[0]
+        return None
+
+    def _get_version_entity(self, item):
+        """
+        Returns the best entity to link the version to.
+        """
+        if item.context.entity:
+            return item.context.entity
+        elif item.context.project:
+            return item.context.project
+        else:
+            return None
